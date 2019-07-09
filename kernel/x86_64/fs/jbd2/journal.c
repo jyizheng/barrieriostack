@@ -50,8 +50,6 @@
 #include <asm/uaccess.h>
 #include <asm/page.h>
 
-#define DELAYED_COMMIT
-
 #ifdef CONFIG_JBD2_DEBUG
 ushort jbd2_journal_enable_debug __read_mostly;
 EXPORT_SYMBOL(jbd2_journal_enable_debug);
@@ -299,22 +297,7 @@ loop:
 		jbd2_journal_cpsetup_transaction(journal);
 		goto loop;
 	}
-#ifdef DELAYED_COMMIT
-	else if (journal->j_running_transaction) {
-		struct journal_head *jh, *next_jh;
-		transaction_t *commit_transaction = journal->j_running_transaction;
-		spin_unlock(&journal->j_cplist_lock);
-		spin_lock(&journal->j_list_lock);
-		list_for_each_entry_safe(jh, next_jh, &commit_transaction->t_jh_wait_list, b_jh_wait_list) {
-			list_del_init(&jh->b_jh_wait_list);
-		}
-		spin_unlock(&journal->j_list_lock);
-	}
-	else
-		spin_unlock(&journal->j_cplist_lock);
-#else
 	spin_unlock(&journal->j_cplist_lock);
-#endif
 
 	if (freezing(current)) {
 		try_to_freeze();
@@ -2664,9 +2647,7 @@ repeat:
 	if (!buffer_jbd(bh)) {
 		new_jh = journal_alloc_journal_head();
 		memset(new_jh, 0, sizeof(*new_jh));
-#ifdef DELAYED_COMMIT
 		INIT_LIST_HEAD(&new_jh->b_jh_wait_list);
-#endif
 	}
 
 	jbd_lock_bh_journal_head(bh);

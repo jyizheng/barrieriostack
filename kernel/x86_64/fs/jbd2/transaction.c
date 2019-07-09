@@ -32,8 +32,6 @@
 
 #include <trace/events/jbd2.h>
 
-#define DELAYED_COMMIT
-
 static void __jbd2_journal_temp_unlink_buffer(struct journal_head *jh);
 static void __jbd2_journal_unfile_buffer(struct journal_head *jh);
 
@@ -109,9 +107,8 @@ jbd2_get_transaction(journal_t *journal, transaction_t *transaction)
 	/* UFS */
 	INIT_LIST_HEAD(&transaction->io_bufs);
 	INIT_LIST_HEAD(&transaction->log_bufs);
-#ifdef DELAYED_COMMIT
 	INIT_LIST_HEAD(&transaction->t_jh_wait_list);
-#endif
+
 	transaction->cbh = NULL;
 	return transaction;
 }
@@ -684,34 +681,6 @@ repeat:
 		trace_jbd2_lock_buffer_stall(bh->b_bdev->bd_dev,
 			jiffies_to_msecs(time_lock));
 
-	/* UFS */
-	if (jh->b_transaction && jh->b_transaction != transaction) {
-#ifdef DELAYED_COMMIT
-		/* insert jh into the buffer list of transaction */
-		/* list_lock*/
-		spin_lock(&journal->j_list_lock);
-		if (list_empty(&jh->b_jh_wait_list)){
-			list_add_tail(&jh->b_jh_wait_list, &transaction->t_jh_wait_list);
-			spin_unlock(&journal->j_list_lock);
-		} else if (jh->b_next_transaction != transaction) {
-			wake_up(&journal->j_wait_cpsetup);
-			spin_unlock(&journal->j_list_lock);
-			unlock_buffer(bh);
-			jbd_unlock_bh_state(bh);
-			wait_event(journal->j_wait_done_cpsetup, jh->b_transaction == transaction || !jh->b_transaction);
-			goto repeat;
-		}  
-		else
-			spin_unlock(&journal->j_list_lock);
-#else
-		wake_up(&journal->j_wait_cpsetup);
-		unlock_buffer(bh);
-		jbd_unlock_bh_state(bh);
-		wait_event(journal->j_wait_done_cpsetup, jh->b_transaction == transaction || !jh->b_transaction);
-		goto repeat;
-#endif
-	}
-
 	/* We now hold the buffer lock so it is safe to query the buffer
 	 * state.  Is the buffer dirty?
 	 *
@@ -893,6 +862,26 @@ done:
 		 * any matching triggers.
 		 */
 		jh->b_frozen_triggers = jh->b_triggers;
+	}
+
+	/* UFS */
+	if (jh->b_transaction && jh->b_transaction != transaction) {
+		/* insert jh into the buffer list of transaction */
+		/* list_lock*/
+		spin_lock(&journal->j_list_lock);
+		if (list_empty(&jh->b_jh_wait_list)){
+			list_add_tail(&jh->b_jh_wait_list, &transaction->t_jh_wait_list);
+			spin_unlock(&journal->j_list_lock);
+		} else if (jh->b_next_transaction != transaction) {
+			wake_up(&journal->j_wait_cpsetup);
+			spin_unlock(&journal->j_list_lock);
+			unlock_buffer(bh);
+			jbd_unlock_bh_state(bh);
+			wait_event(journal->j_wait_done_cpsetup, jh->b_transaction == transaction || !jh->b_transaction);
+			goto repeat;
+		}  
+		else
+			spin_unlock(&journal->j_list_lock);
 	}
 	jbd_unlock_bh_state(bh);
 
@@ -1215,9 +1204,6 @@ int jbd2_journal_dirty_metadata(handle_t *handle, struct buffer_head *bh)
 	struct journal_head *jh;
 	int ret = 0;
 
-#ifdef CPSETUPWAIT
-repeat:
-#endif
 	if (is_handle_aborted(handle))
 		goto out;
 	jh = jbd2_journal_grab_journal_head(bh);
@@ -1229,24 +1215,6 @@ repeat:
 	JBUFFER_TRACE(jh, "entry");
 
 	jbd_lock_bh_state(bh);
-
-	/* UFS */
-#ifdef CPSETUPWAIT
-	if (jh->b_transaction && jh->b_transaction != transaction) {
-		if (jh->b_next_transaction != transaction)
-			printk(KERN_ERR "UFS: %s: ERROR no ref to running tx \n", __func__);
-		read_lock(&journal->j_state_lock);
-		if (tid_gt(jh->b_transaction->t_tid, journal->j_cpsetup_sequence)) {
-			wake_up(&journal->j_wait_cpsetup);
-			read_unlock(&journal->j_state_lock);
-			jbd2_journal_put_journal_head(jh);
-			jbd_unlock_bh_state(bh);
-			wait_event(journal->j_wait_done_cpsetup, jh->b_transaction == transaction);
-			goto repeat;
-		}
-		read_unlock(&journal->j_state_lock);
-	}
-#endif
 
 	if (jh->b_modified == 0) {
 		/*
@@ -1455,6 +1423,7 @@ repeat:
 		if (jh->b_next_transaction) {
 			J_ASSERT(jh->b_next_transaction == transaction);
 			jh->b_next_transaction = NULL;
+			list_del_init(&jh->b_jh_wait_list);
 
 			/*
 			 * only drop a reference if this transaction modified
@@ -2316,11 +2285,7 @@ void __jbd2_journal_refile_buffer(struct journal_head *jh)
 	if (jh->b_transaction)
 		assert_spin_locked(&jh->b_transaction->t_journal->j_list_lock);
 
-#ifdef DELAYED_COMMIT
-	//spin_lock(&journal->j_list_lock);
 	list_del_init(&jh->b_jh_wait_list);
-	//spin_unlock(&journal->j_list_lock);
-#endif
 
 	/* If the buffer is now unused, just drop it. */
 	if (jh->b_next_transaction == NULL) {
